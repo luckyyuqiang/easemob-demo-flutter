@@ -1,5 +1,7 @@
 // ignore_for_file: deprecated_member_use
 
+import 'dart:io';
+
 import 'package:chat_uikit_demo/custom/demo_helper.dart';
 import 'package:chat_uikit_demo/demo_localizations.dart';
 import 'package:chat_uikit_demo/custom/call_helper.dart';
@@ -16,11 +18,15 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/gestures.dart';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_easyloading/flutter_easyloading.dart';
-// import 'package:image_gallery_saver/image_gallery_saver.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 class ChatRouteFilter {
+  static const MethodChannel _mediaChannel =
+      MethodChannel('chat_uikit_demo/media');
+
   static RouteSettings chatRouteSettings(RouteSettings settings) {
     // 拦截 ChatUIKitRouteNames.messagesView, 之后对要跳转的页面的 `RouteSettings` 进行自定义，之后返回。
     if (settings.name == ChatUIKitRouteNames.messagesView) {
@@ -31,8 +37,187 @@ class ChatRouteFilter {
       return contactDetail(settings);
     } else if (settings.name == ChatUIKitRouteNames.groupDetailsView) {
       return groupDetail(settings);
+    } else if (settings.name == ChatUIKitRouteNames.showImageView) {
+      return showImageView(settings);
     }
     return settings;
+  }
+
+  static RouteSettings showImageView(RouteSettings settings) {
+    ShowImageViewArguments arguments =
+        settings.arguments as ShowImageViewArguments;
+    final appBarModel = arguments.appBarModel;
+
+    arguments = arguments.copyWith(
+      appBarModel: ChatUIKitAppBarModel(
+        title: appBarModel?.title,
+        centerWidget: appBarModel?.centerWidget,
+        titleTextStyle: appBarModel?.titleTextStyle,
+        subtitle: appBarModel?.subtitle,
+        subTitleTextStyle: appBarModel?.subTitleTextStyle,
+        leadingActions: appBarModel?.leadingActions,
+        leadingActionsBuilder: appBarModel?.leadingActionsBuilder,
+        trailingActions: appBarModel?.trailingActions,
+        trailingActionsBuilder: (context, defaultList) {
+          final actions = <ChatUIKitAppBarAction>[
+            ...?appBarModel?.trailingActions,
+            ...?appBarModel?.trailingActionsBuilder?.call(context, defaultList),
+          ];
+          actions.add(
+            ChatUIKitAppBarAction(
+              onTap: (context) =>
+                  _saveImageToGallery(context, arguments.message),
+              child: const Padding(
+                padding: EdgeInsets.all(8),
+                child: Icon(
+                  Icons.download_rounded,
+                  color: Colors.white,
+                  size: 24,
+                ),
+              ),
+            ),
+          );
+          return actions;
+        },
+        showBackButton: appBarModel?.showBackButton ?? true,
+        onBackButtonPressed: appBarModel?.onBackButtonPressed,
+        centerTitle: appBarModel?.centerTitle ?? false,
+        systemOverlayStyle: appBarModel?.systemOverlayStyle,
+        backgroundColor: appBarModel?.backgroundColor,
+        bottomLine: appBarModel?.bottomLine,
+        bottomLineColor: appBarModel?.bottomLineColor,
+        flexibleSpace: appBarModel?.flexibleSpace,
+        bottomWidget: appBarModel?.bottomWidget,
+        bottomWidgetHeight: appBarModel?.bottomWidgetHeight,
+      ),
+      onLongPressed: arguments.onLongPressed ??
+          (context, message) => _showSaveImageActionSheet(context, message),
+    );
+    return RouteSettings(name: settings.name, arguments: arguments);
+  }
+
+  static Future<void> _showSaveImageActionSheet(
+    BuildContext context,
+    Message message,
+  ) async {
+    await showCupertinoModalPopup<void>(
+      context: context,
+      builder: (sheetContext) {
+        return CupertinoActionSheet(
+          actions: [
+            CupertinoActionSheetAction(
+              onPressed: () async {
+                Navigator.of(sheetContext).pop();
+                await _saveImageToGallery(context, message);
+              },
+              child:
+                  Text(DemoLocalizations.saveImage.localString(sheetContext)),
+            ),
+          ],
+          cancelButton: CupertinoActionSheetAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(sheetContext).pop(),
+            child: Text(ChatUIKitLocal.cancel.localString(sheetContext)),
+          ),
+        );
+      },
+    );
+  }
+
+  static Future<void> _saveImageToGallery(
+    BuildContext context,
+    Message message,
+  ) async {
+    final downloadingText = DemoLocalizations.downloading.localString(context);
+    final noPermissionText =
+        DemoLocalizations.noStoragePermission.localString(context);
+    final saveSuccessText =
+        DemoLocalizations.saveImageSuccess.localString(context);
+    final saveFailedText =
+        DemoLocalizations.saveImageFailed.localString(context);
+    EasyLoading.show(status: downloadingText);
+    try {
+      final hasPermission = await _requestSaveImagePermission();
+      if (!hasPermission) {
+        EasyLoading.dismiss();
+        EasyLoading.showError(noPermissionText);
+        return;
+      }
+
+      final imagePath = await _ensureImageLocalPath(message);
+      if (imagePath == null) {
+        EasyLoading.dismiss();
+        EasyLoading.showError(saveFailedText);
+        return;
+      }
+
+      final result = await _mediaChannel.invokeMethod<bool>(
+        'saveImageToGallery',
+        {
+          'path': imagePath,
+        },
+      );
+      EasyLoading.dismiss();
+      if (_isGallerySaveSuccess(result)) {
+        EasyLoading.showSuccess(saveSuccessText);
+      } else {
+        EasyLoading.showError(saveFailedText);
+      }
+    } catch (e) {
+      EasyLoading.dismiss();
+      EasyLoading.showError(saveFailedText);
+    }
+  }
+
+  static Future<bool> _requestSaveImagePermission() async {
+    if (Platform.isIOS) {
+      final status = await Permission.photosAddOnly.request();
+      return status.isGranted || status.isLimited;
+    }
+
+    if (Platform.isAndroid) {
+      PermissionStatus photosStatus = await Permission.photos.request();
+      if (photosStatus.isGranted || photosStatus.isLimited) {
+        return true;
+      }
+
+      PermissionStatus storageStatus = await Permission.storage.request();
+      return storageStatus.isGranted;
+    }
+
+    return true;
+  }
+
+  static Future<String?> _ensureImageLocalPath(Message message) async {
+    if (message.bodyType != MessageType.IMAGE ||
+        message.body is! ImageMessageBody) {
+      return null;
+    }
+
+    final body = message.body as ImageMessageBody;
+    final candidatePaths = <String?>[
+      body.localPath,
+      body.thumbnailLocalPath,
+    ];
+
+    for (final path in candidatePaths) {
+      if (path?.isNotEmpty != true) {
+        continue;
+      }
+      final file = File(path!);
+      if (await file.exists()) {
+        return file.path;
+      }
+    }
+
+    return null;
+  }
+
+  static bool _isGallerySaveSuccess(dynamic result) {
+    if (result is bool) {
+      return result;
+    }
+    return false;
   }
 
   static RouteSettings groupDetail(RouteSettings settings) {
